@@ -1,0 +1,13 @@
+TODO
+
+    - 'codeIsNoErrors' - need to change this name, as it is obfuscating.
+
+    - Storage unbound may be more complex to avoid output of some informational noise. Try to unmount storage when it is already unmounted.
+
+    - Make it less talkative.
+
+    - '--info' action may show processes using the storage.
+
+BUGS
+
+    - Not tested.

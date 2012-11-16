@@ -1,0 +1,1223 @@
+#!/bin/bash
+
+#
+#  Copyright 2008-2012 Alex Vesev
+#
+#  This file is part of DMLEncr Storage. DMLEncr should be unwraped as
+#  DM & LUKS Encrypted Storage Manager.
+#
+#  DMLEncr Storage is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+#
+#  DMLEncr Storage is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with DMLEncr Storage.  If not, see <http://www.gnu.org/licenses/>.
+#
+##
+
+#  This program is manager of encrypted filesystem and data storage
+#  to be located inside a file or partition (partition - not implemented).
+#
+#  This is implementation of some automation for DM-Crypt and LUKS.
+#
+##
+
+terminalBin="/usr/bin/lx-terminal"
+if which "${terminalBin}" 2>/dev/null >/dev/null ; then
+    tty -s
+    [ $? -ne 0 ] \
+        && "${terminalBin}" -e "\"${0}\" \"${@}\"" \
+        && exit ${?}
+fi
+
+
+declare -r  storageIsClosedMessage="Storage is closed"
+declare -r  storageInUseMessage="Storage is in use, or it's components are locked"
+declare -r  storagePlaceHolderMessage="Storage is locked by"
+declare -r  storageIsAlreadyMounted="Storage already in use and mounted somewhere, or some parts (loop device, LUKS volume, mount point) are locked by something. Unmount will try to free the resources"
+
+declare -r  fileConfigurationDefault="${HOME}/.config/dmlencr/dmlencr.conf"
+
+declare     fileConfig=""
+declare     fileLoopDev=""
+declare     dirWithFileStorageContainer=""
+declare     mappingName=""
+
+declare     fileStorageContainer=""
+declare     sizeStorageInMb=""
+declare     fSystemId=""
+declare     ownerId=""
+declare     dirMountPoint=""
+declare     optionsLuks=""
+declare     fileHeaderBackup=""
+
+declare -ri noError=0 # Zero is OK
+declare -ri errorMisc=1
+declare -ri undefinedErrorState=253
+declare -ri errorEpic=254
+declare -ri stateIsMounted=100
+declare -ri stateIsNotMounted=101
+declare     stateOfProcess=${noError}
+
+declare -ri codeSuccess=0
+declare -ri codeFailure=1
+
+function printConfigurationFileExample {
+    local fileNameForOutput=""
+
+    fileNameForOutput="${fileConfigurationDefault/${HOME}/~}"
+
+cat <<- EOF
+#
+#  This is example of configuration file
+#  for DMLEncr Storage script.
+#
+#  You may correct it, put into a file and use the file as argument
+#  specified via command line inetrface.
+#
+#  Default configuration file is:
+#    "${fileNameForOutput}"
+#
+#  Default configuration file creation commands:
+#    mkdir -p "$( dirname "${fileNameForOutput}" )"
+#    touch "${fileNameForOutput}"
+#    chown ${USER}:${USER} "${fileNameForOutput}"
+#    chmod 600 "${fileNameForOutput}"
+#    sudo "$( basename "${0}" )" --output-example-config >> "${fileNameForOutput}"
+#
+
+# Storage container file name.
+storage-file    =   ./DMLEncr-data-container-img
+
+# Storage container size in Mb.
+size            =   10
+
+# Hardcoded to be 'ext3'.
+filesystem      =   ext3
+
+# Storage infrastructure owner. Existent user name. Will be set as owner of storage container.
+owner           =   userName
+
+# Directory to be mount point.
+mnt             =   ./mnt
+
+# Used while a storage creation only. As single string all additional options for 'cryptsetup luksFormat ...', except device name.
+luks-options    =   --iter-time 1000 --use-random
+EOF
+
+}
+
+function printMessageIsInUse {
+    echo -e "________________________\n\n${storageInUseMessage}.\n" >&2
+
+}
+
+function printMessageIsClosed {
+    echo -e "________________________\n\n${storageIsClosedMessage}.\n" >&2
+}
+
+function printMessageIsAlreadyMounted {
+    echo -e "________________________\n\n${storageIsAlreadyMounted}.\n" >&2
+}
+
+# # #
+ # #
+# #     Backup related functions set
+ #
+#
+
+function backupHeader {
+    # Donor -> Acceptor
+    local fileWithStorageAsDonor="${1}"
+    local fileBackupAcceptor="${2}"
+
+    local codeIsNoErrors=${codeSuccess}
+
+    declare -r timestamp="$( date '+%Y-%m-%d-%H%M-%S' )"
+    [ -z "${fileBackupAcceptor}" ] \
+        && declare -r fileBackupAcceptor="${dirWithFileStorageContainer}/backup-header-${timestamp}"
+
+    [ ! -e "${fileWithStorageAsDonor}" ] \
+        && echo "ERROR:${0}:${LINENO}: Not found donor of data to be backed-up '${fileWithStorageAsDonor}'." >&2 \
+        && exit ${errorMisc}
+    [ -e "${fileBackupAcceptor}" ] \
+        && echo "ERROR:${0}:${LINENO}: Already exist target '${fileBackupAcceptor}', specified as backup acceptor. Do nothing, bailing out." >&2 \
+        && exit ${errorMisc}
+
+    declare -r fileLoopDev="$( associateFileWithLoopDevice "${fileWithStorageAsDonor}" )"
+
+    ! cryptsetup luksHeaderBackup "${fileLoopDev}" --header-backup-file "${fileBackupAcceptor}" \
+        && codeIsNoErrors=${codeSuccess}
+    setRestrictedAccessForFile "${ownerId}" "${ownerId}" "${fileBackupAcceptor}"
+    ! losetup -d "${fileLoopDev}" \
+        && codeIsNoErrors=${codeSuccess}
+
+    [ "${codeIsNoErrors}" != "${codeSuccess}" ] \
+        && echo "INFORMATION:${0}:${LINENO}: Done, but something went wrong while backup." >&2 \
+        && return ${codeIsNoErrors}
+
+    echo "INFORMATION:${0}:${LINENO}: Backup is done." >&2
+    printOutHowToEncryptBackup "${fileWithStorageAsDonor}" "${fileBackupAcceptor}"
+    return ${codeIsNoErrors}
+}
+
+function restoreHeader {
+    # From -> To
+    local fileWithBackup="${1}"
+    local fileWithStorageAsBackupAcceptor="${2}"
+
+    [ -z "${fileWithBackup}" ] \
+        && declare -r fileWithBackup="${dirWithFileStorageContainer}/backup-header"
+
+    [ ! -e "${fileWithBackup}" ] \
+        && echo "ERROR:${0}:${LINENO}: Not found backup source '${fileWithBackup}'." >&2 \
+        && exit ${errorMisc}
+    [ ! -e "${fileWithStorageAsBackupAcceptor}" ] \
+        && echo "ERROR:${0}:${LINENO}: Not found backup acceptor '${fileWithStorageAsBackupAcceptor}'." >&2 \
+        && exit ${errorMisc}
+
+    declare -r fileLoopDev="$( losetup -f --show "${fileWithStorageAsBackupAcceptor}" )"
+    cryptsetup luksHeaderRestore "${fileLoopDev}" --header-backup-file "${fileWithBackup}"
+    losetup -d "${fileLoopDev}"
+}
+
+
+function printOutHowToEncryptBackup {
+    local fileDonorOfData="${1}"
+    local fileAcceptorBackup="${2}"
+
+    #  In context of BASH "Here Documents" operator '<<-' and tabs stripping,
+    #  Geany tabs parsing feature seems not to be supported in a wanted fashion.
+    cat <<- EOF
+
+        One may want to encrypt the backup:
+
+WARNING: Tmpfs can swap to harddisk if low on memory so it is not recommended here.
+
+        #   sudo su
+        #   declare -r gpgUserId="GPGUserId"
+        #   declare -r fileDonorOfData="${fileDonorOfData}"
+        #   declare -r fileShortNameHeaderBackup="$( basename "${fileAcceptorBackup}" )"
+        #   declare -r fileLoopDev="\$( losetup -f --show "\${fileDonorOfData}" )"
+        #   declare -r dirTmp="\${HOME}/tmp-timestamp"
+        #
+        #   mkdir "\${dirTmp}"
+        #   mount ramfs "\${dirTmp}" -t ramfs
+        #   cryptsetup luksHeaderBackup "\${fileLoopDev}" --header-backup-file "\${dirTmp}/\${fileShortNameHeaderBackup}"
+        #   gpg2 --recipient "\${gpgUserId}" --encrypt "\${dirTmp}/\${fileShortNameHeaderBackup}"
+        #   wipe "\${dirTmp}/\${fileShortNameHeaderBackup}"
+        #   cp "\${dirTmp}/\${fileShortNameHeaderBackup}.gpg" "\${dirWithFileStorageContainer}"
+        #   losetup -d "\${fileLoopDev}"
+        #   umount "\${dirTmp}"
+EOF
+}
+
+#
+ #
+# #     Backup related functions set
+ # #
+# # #
+
+function generateMappingNameFromFileName {
+    local -r fileName="${1}"
+    local    resultingmappingName=""
+
+    resultingmappingName="$( basename "${fileName}" )"
+    resultingmappingName="${resultingmappingName/./}"
+    echo "${resultingmappingName}"
+}
+
+# # #
+ # #
+# #     Mount functions set
+ #
+#
+
+function mountEncryptedStorage {
+    local -r fileWithStorage="${1}"
+    local -r targetDirMountPoint="${2}"
+
+    local    fileLoopDev=""
+    local    targetLoopDevMappingName=""
+
+    targetLoopDevMappingName="$( generateMappingNameFromFileName "${fileWithStorage}" )"
+
+    isMounted "${targetDirMountPoint}" 2>/dev/null \
+        && echo "ERROR:${0}:${LINENO}: ${storageIsAlreadyMounted}." >&2 \
+        && exit ${errorMisc}
+
+    fileLoopDev="$( associateFileWithLoopDevice "${fileWithStorage}" )"
+
+    echo "Ready to mount filesystem."
+    cryptsetup --verbose luksOpen "${fileLoopDev}" "${targetLoopDevMappingName}"
+    mount -t ext3 /dev/mapper/${targetLoopDevMappingName} "${targetDirMountPoint}"
+}
+
+function associateFileWithLoopDevice {
+    local -r fileWithStorageContainer="${1}"
+
+    local    loopDeviceFile=""
+
+    loopDeviceFile="$( losetup -f --show "${fileWithStorageContainer}" )"
+    echo "${loopDeviceFile}"
+}
+
+#
+ #
+# #     Mount functions set
+ # #
+# # #
+
+# # #
+ # #
+# #     Unmount functions set
+ #
+#
+
+function unmountEncryptedStorage {
+    local -r fileStorage="${1}"
+
+    local    codeIsNoErrors=${codeSuccess}
+
+    local    storageLoopDevMappingName=""
+    local    storageDirMountPoint=""
+
+    storageLoopDevMappingName="$( generateMappingNameFromFileName "${fileStorage}" )"
+    storageDirMountPoint="$( printMountPointFromMappingName "${storageLoopDevMappingName}" )"
+
+    ! unboundMountPoint "${storageDirMountPoint}" \
+        && codeIsNoErrors=${codeFailure}
+    ! unboundContainer "${fileStorage}" "${storageLoopDevMappingName}" \
+        && codeIsNoErrors=${codeFailure}
+    return ${codeIsNoErrors}
+}
+
+function unboundMountPoint {
+    local -r dirToBeUnmounted="${1}"
+
+    local    codeIsNoErrors=${codeSuccess}
+
+    [ ! -d "${dirToBeUnmounted}" ] \
+        && echo "ERROR:${0}:${LINENO}: Not found or not a directory object named '${dirToBeUnmounted}'." >&2 \
+        && codeIsNoErrors=${codeFailure} \
+        && return ${codeIsNoErrors}
+
+    if isMounted "${dirToBeUnmounted}" 2>/dev/null ; then
+        ! umount "${dirToBeUnmounted}" \
+            && echo "ERROR:${0}:${LINENO}: Failed with unmount of directory '${dirToBeUnmounted}'." >&2 \
+            && codeIsNoErrors=${codeFailure}
+    fi
+    return ${codeIsNoErrors}
+}
+
+function unboundContainer {
+    local -r fileStorage="${1}"
+    local -r mappingDeviceFileName="${2}"
+
+    local    codeIsNoErrors=${codeSuccess}
+
+    #local    fileForLoopDevice=""
+    #fileForLoopDevice="$( printLoopDevFileNameFromMappingName "${mappingDeviceFileName}" )"
+
+    ! detachLuksVolume "${mappingDeviceFileName}" \
+        && codeIsNoErrors=${codeFailure}
+    ! detachAssociatedLoopDevices "${fileStorage}" \
+        && codeIsNoErrors=${codeFailure}
+    return ${codeIsNoErrors}
+}
+
+function detachLuksVolume {
+    local -r mappingDeviceFileName="${1}"
+
+    ! cryptsetup luksClose "${mappingDeviceFileName}" \
+        && echo "ERROR:${0}:${LINENO}: failed to detach LUKS volume with mapping name '${mappingDeviceFileName}'." >&2 \
+        && return ${codeFailure}
+    return ${codeSuccess}
+
+}
+
+function detachAssociatedLoopDevices {
+    local -r fileStorage="${1}"
+
+    local    codeIsNoErrors=${codeSuccess}
+    local    loopDevFile=""
+    local    stub=""
+
+    shopt -s extglob
+    while read loopDevFile stub ; do
+        if [ -n "${loopDevFile}" ] ; then
+            loopDevFile="${loopDevFile/%:/}"
+            ! losetup --detach "${loopDevFile}" \
+                && echo "ERROR:${0}:${LINENO}: failed to detach '${loopDevFile}'." >&2 \
+                && codeIsNoErrors=${codeFailure}
+        fi
+    done <<< "$( losetup --associated "${fileStorage}" )"
+    return ${codeIsNoErrors}
+
+    # Under some circumstance this may not indicated some busy devices.
+    # Then - the devices will not be freed.
+    #
+    # read stub fileForLoopDevice <<< "$( cryptsetup status ${targetMappingName} \
+    #                                       | egrep "^([[:space:]]*)device:([[:space:]]*)" )"
+}
+
+#function printLoopDevFileNameFromMappingName {
+    #local -r targetMappingName="${1}"
+    #local    fileForLoopDevice=""
+
+    #shopt -s extglob
+    #read stub fileForLoopDevice <<< "$( cryptsetup status ${targetMappingName} \
+                                            #| egrep "^([[:space:]]*)device:([[:space:]]*)" )"
+    #echo "${fileForLoopDevice}"
+#}
+
+function printMountPointFromMappingName {
+    local -r targetMappingName="${1}"
+    local    dirMountPoint=""
+
+    read devMapperAsStub stub1 dirMountPoint stub2 <<< "$( mount | grep /dev/mapper/${targetMappingName} )"
+    echo "${dirMountPoint}"
+}
+
+#
+ #
+# #     Unmount functions set
+ # #
+# # #
+
+
+# # #
+ # #
+# #     Test functions: if mounted, if opened, if bounded...
+ #
+#
+
+function isUnbuttoned {
+    local -r fileStorage="${1}"
+    local -r targetMntPoint="${2}"
+    local -r targetMappingName="${3}"
+
+    if isMounted "${targetMntPoint}" \
+        || isLuksVolumeOpened "${targetMappingName}" \
+        || isAssociatedWithLoop "${fileStorage}"
+    then
+        echo "INFORMATION:${0}:${LINENO}: It seems some parts of '${targetMappingName}' are in use." >/dev/null
+        printPlaceHoldersForMountPoint "${targetMntPoint}"
+        return ${codeSuccess}
+    fi
+    return ${codeFailure}
+}
+
+function isMounted {
+    local -r  targetMntPoint="${1}"
+
+    local -ri codeTargetNotAccepted=2
+
+    [ ! -d "${targetMntPoint}" ] \
+        && echo "ERROR:${0}:${LINENO}: target '${targetMntPoint}' is not a directory or not found." >&2 \
+        && return ${codeTargetNotAccepted}
+
+    if [ -z "$(mount | grep "${targetMntPoint}")" ] ; then
+        #echo -e "________________________\n\n${storageIsClosedMessage}.\n" >&2
+        return ${codeFailure}
+    else
+        #printPlaceHoldersForMountPoint "${targetMntPoint}"
+        #echo -e "________________________\n\n${storageInUseMessage}.\n" >&2
+        return ${codeSuccess}
+    fi
+}
+
+function isAssociatedWithLoop {
+    local -r fileStorage="${1}"
+    local    loopSetUpFeedback=""
+
+    read loopSetUpFeedback <<< "$( losetup --associated "${fileStorage}" )"
+
+    [ -z "${loopSetUpFeedback}" ] \
+        && return ${codeFailure}
+    return ${codeSuccess}
+}
+
+
+function isLuksVolumeOpened {
+    local -r targetMappingName="${1}"
+
+    local    cryptSetUpFeedback=""
+
+    local    codeLuksVolumeIsOpened=${codeSuccess}
+
+    cryptsetup status ${targetMappingName} \
+        ; cryptSetUpFeedback=${?}
+
+    case "${cryptSetUpFeedback}" in
+    0)
+        echo "INFORMATION:${0}:${LINENO}: Cryptsetup that: success." >&2
+        codeLuksVolumeIsOpened=${codeSuccess}
+    ;;
+    1)
+        echo "INFORMATION:${0}:${LINENO}: Cryptsetup that: code '${cryptSetUpFeedback}', wrong parameters." >&2
+        codeLuksVolumeIsOpened=${codeFailure}
+    ;;
+    2)
+        echo "INFORMATION:${0}:${LINENO}: Cryptsetup that: code '${cryptSetUpFeedback}', no permission (bad passphrase)." >&2
+        codeLuksVolumeIsOpened=${codeFailure}
+    ;;
+    3)
+        echo "INFORMATION:${0}:${LINENO}: Cryptsetup that: code '${cryptSetUpFeedback}', out of memory." >&2
+        codeLuksVolumeIsOpened=${codeFailure}
+    ;;
+    4)
+        echo "INFORMATION:${0}:${LINENO}: Cryptsetup that: code '${cryptSetUpFeedback}', wrong device specified." >&2
+        codeLuksVolumeIsOpened=${codeFailure}
+    ;;
+    5)
+        echo "INFORMATION:${0}:${LINENO}: Cryptsetup that: code '${cryptSetUpFeedback}', device already exists or device is busy." >&2
+        codeLuksVolumeIsOpened=${codeFailure}
+    ;;
+    *)
+        echo "ERROR:${0}:${LINENO}: Unknown feedback from Cryptsetup, code '${cryptSetUpFeedback}'." >&2
+        codeLuksVolumeIsOpened=${codeFailure}
+    ;;
+    esac
+
+    return ${codeLuksVolumeIsOpened}
+
+}
+
+#
+ #
+# #     Test functions: if mounted, if opened, if bounded...
+ # #
+# # #
+
+
+function printPlaceHoldersForMountPoint {
+    local -r  targetMntPoint="${1}"
+    local -i  idx=-1
+
+    local -a  objectsFoundList=("program" "pid")
+    local -ri arrayDimension=2
+
+    local command=""
+    local pid=""
+    local user=""
+    local fd=""
+    local type=""
+    local device=""
+    local sizeAndOff=""
+    local node=""
+    local name=""
+
+    unset objectsFoundList[@]
+    idx=0
+    while read command pid user fd type device sizeAndOff node name misc
+    do
+        [ "${command}" == "COMMAND" ] \
+            && continue
+        objectsFoundList[idx]="${command}"
+        objectsFoundList[idx+1]="${pid}"
+        ((idx+=arrayDimension))
+        done <<< "$( lsof "${targetMntPoint}" 2>/dev/null )"
+    while read pid misc ; do
+        read command misc <<< "$( ps ax -o command,pid | grep "${pid}" | egrep -v "grep[[:space:]]+${pid}")"
+        objectsFoundList[idx]="${command}"
+        objectsFoundList[idx+1]="${pid}"
+        ((idx+=arrayDimension))
+    done <<< "$( fuser -m "${targetMntPoint}" 2>/dev/null )"
+
+    if [ ${#objectsFoundList} != 0 ] ; then
+        echo "" >&2
+        echo "${storagePlaceHolderMessage}:" >&2
+        for (( idx=0 ; idx<${#objectsFoundList}-1 ; idx+=arrayDimension ))
+        do
+            echo -n "${objectsFoundList[idx+1]}"
+            echo -ne "\t\t"
+            echo "${objectsFoundList[idx]}"
+        done
+        return ${codeFailure}
+    fi
+    return ${codeSuccess}
+}
+
+function createEmptyStorageContainer {
+    local -r  fileContainer="${1}"
+    local -ri containerSize="${2}"
+
+    #local -r  devInitiateFrom="/dev/random"
+    local -r  devInitiateFrom="/dev/urandom"
+    #local -r  devInitiateFrom="/dev/zero"
+
+    local -ri codeIsSuccess=${codeFailure}
+
+    local -r  dirWithContainer="$( dirname "${fileContainer}" )"
+
+    [ -e "${fileContainer}" ] \
+        && echo "ERROR:${0}:${LINENO}: Already exist storage container '${fileContainer}'. Do nothing." >&2 \
+        && exit ${errorMisc}
+
+    echo "INFORMATION:${0}:${LINENO}: Starting container creation and filling it with initial bytes available from '${devInitiateFrom}'." >&2
+    echo "INFORMATION:${0}:${LINENO}: See 'man dd' - on 'kill -USR1 pid' it will print I/O statistics to standard error."
+
+    mkdir -p "${dirWithContainer}"
+    setRestrictedAccessForDirectory "${ownerId}" "${ownerId}" "${dirWithContainer}"
+
+    touch "${fileContainer}"
+    setRestrictedAccessForFile "${ownerId}" "${ownerId}" "${fileContainer}"
+
+    # Container for DMCrypt and LUKS have minimum size (0.5,1,2Mb?). It is validated earlier.
+    dd bs=1M count="${containerSize}" if="${devInitiateFrom}" of="${fileContainer}"
+
+    [ ! -f "${fileContainer}" ] \
+        && echo "ERROR:${0}:${LINENO}: Failed to create storage container '${fileContainer}'." >&2 \
+        && exit ${errorMisc}
+
+    return ${codeIsSuccess}
+}
+
+
+function createMntPoint {
+    local mountPoint="${1}"
+
+    [ ! -e "${mountPoint}" ] \
+        && mkdir -p "${mountPoint}" \
+
+    [ -d "${mountPoint}" ] \
+        && setRestrictedAccessForDirectory "${ownerId}" "${ownerId}" "${mountPoint}" \
+        && return ${codeSuccess}
+
+    echo "ERROR:${0}:${LINENO}: Skiped mount point creation or failed to create. Error token is '${mountPoint}'." >&2
+    return ${codeFailure}
+}
+
+function setRestrictedAccessForFile {
+    local -r  owner="${1}"
+    local -r  group="${2}"
+    local -r  file="${3}"
+
+    local     isNoErrors=${codeSuccess}
+
+    [ ! -f "${file}" ] \
+        && echo "ERROR:${0}:${LINENO}: Not found file '${file}'." >&2 \
+        && exit ${errorMisc}
+
+    ! chmod 600 "${file}" \
+        && isNoErrors=${codeFailure}
+    ! chown "${owner}":"${group}" "${file}" \
+        && isNoErrors=${codeFailure}
+
+    [ "${isNoErrors}" != "${codeSuccess}" ] \
+        && echo "ERROR:${0}:${LINENO}: Failed with file access setup. Error token '${file}'." >&2
+    return ${isNoErrors}
+}
+
+function setRestrictedAccessForDirectory {
+    local -r  owner="${1}"
+    local -r  group="${2}"
+    local -r  directory="${3}"
+
+    local     isNoErrors=${codeSuccess}
+
+    [ ! -d "${directory}" ] \
+        && echo "ERROR:${0}:${LINENO}: Not found directory '${directory}'." >&2 \
+        && exit ${errorMisc}
+
+    ! chmod 700 "${directory}" \
+        && isNoErrors=${codeFailure}
+    ! chown "${owner}":"${group}" "${directory}" \
+        && isNoErrors=${codeFailure}
+
+    [ "${isNoErrors}" != "${codeSuccess}" ] \
+        && echo "ERROR:${0}:${LINENO}: Failed with directory access setup. Error token '${directory}'." >&2
+
+    return ${isNoErrors}
+}
+
+function validateContainerFileName {
+    local -r targetFileName="$( basename "${1}" )"
+
+    if ! [[ "${targetFileName}" =~ ^([a-zA-Z0-9-]*)$ ]] ; then
+        echo "ERROR:${0}:${LINENO}: Filename may contain only a-z, A-Z, 0-9 and -. Error token is '${targetFileName}'." >&2
+        stateOfProcess=${errorMisc}
+        return ${codeFailure}
+    fi
+    return ${codeSuccess}
+
+}
+
+function tryEvaluateConfigNameAmongArguments {
+    local singleArgument=""
+    local fileConfig=""
+
+    shopt -s extglob
+
+    for singleArgument in "${@}" ; do
+        valueForArgument="${singleArgument#*=}" # Strip leading '*='.
+        singleArgument="${singleArgument/#*([[:space:]])--/}" # Strip leading space and '--'.
+        singleArgument="${singleArgument%%=*}" # Strip trailing '=*'
+        [ "${singleArgument}" == "config" ] \
+            && [ -z "${fileConfig}" ] \
+            && fileConfig="$( healPath "${valueForArgument}" )" \
+            && break
+    done
+
+    if [ -n "${fileConfig}" ]
+    then
+        [ ! -f "${fileConfig}" ] \
+            && echo "ERROR:${0}:${LINENO}: Storage configuration file specified but not found. The file name evaluated as '${fileConfig}'." >&2 \
+            && stateOfProcess=${errorMisc} \
+            && return ${codeFailure}
+    elif [ -z "${fileConfig}" ]
+    then
+        [ -f "${fileConfigurationDefault}" ] \
+            && fileConfig="${fileConfigurationDefault}"
+    fi
+
+    echo -n "${fileConfig}"
+    return ${codeSuccess}
+
+}
+
+function setArgumentsFromConfig {
+    local -r fileConfigDonor="${1}"
+
+    local    confLine=""
+    local    argument=""
+    local    valueForArgument=""
+    local -i idx=0
+
+    [ ! -f "${fileConfigDonor}" ] \
+        && echo "ERROR:${0}:${LINENO}: Not found storage configuration file '${fileConfigDonor}'." >&2 \
+        && exit ${stateOfProcess}
+
+    idx=0
+    while read confLine ; do
+        confLine="$( clearConfLine "${confLine}" )"
+        argument="${confLine%%=*}" # Strip trailing '=*'.
+        valueForArgument="${confLine#*=}" # Strip leading '*='.
+        if [ -n "${argument}" ] ; then
+            [ -n "${valueForArgument}" ] \
+                && optionsListFromConfigFile[idx]="--${argument}=${valueForArgument}"
+            [ -z "${valueForArgument}" ] \
+                && optionsListFromConfigFile[idx]="--${argument}"
+            ((idx++))
+        fi
+    done < "${fileConfigDonor}"
+}
+
+function clearConfLine {
+    local -r targetConfLine="${1}"
+    local    confKey=""
+    local    confValue=""
+
+    confKey="$( extractConfKeyNameFromLine "${targetConfLine}" )"
+    confValue="$( extractConfValueFromLine "${targetConfLine}" )"
+
+    echo -n "${confKey}=${confValue}"
+
+}
+
+function extractConfKeyNameFromLine {
+    local -r targetLine="${1}"
+
+    shopt -s extglob
+
+    isConfFileLineAComment "${targetLine}" \
+        && echo -n "" \
+        && return ${codeFailure}
+
+    confKey="${targetLine}"
+    confKey="${confKey/#*([[:space:]])/}" # Strip leading space.
+    confKey="${confKey%%=*}" # Strip trailing '=*'
+    confKey="${confKey/%*([[:space:]])/}" # Strip trailing space.
+
+    echo -n "${confKey}"
+    return ${codeSuccess}
+}
+
+function extractConfValueFromLine {
+    local targetLine="${1}"
+
+    shopt -s extglob
+
+    isConfFileLineAComment "${targetLine}" \
+        && echo -n "" \
+        && return ${codeFailure}
+
+    confValue="${targetLine}"
+    confValue="${confValue#*=}" # Strip leading '*='.
+    confValue="${confValue/#*([[:space:]])/}" # Strip leading space.
+    confValue="${confValue/%*([[:space:]])/}" # Strip trailing space.
+
+    echo -n "${confValue}"
+    return ${codeSuccess}
+
+}
+
+function isConfFileLineAComment {
+    local targetLine="${1}"
+
+    shopt -s extglob
+    targetLine="${targetLine/#*([[:space:]])/}" # Strip leading space.
+    [ "${targetLine:0:1}" == "#" ] \
+        && return ${codeSuccess}
+    return ${codeFailure}
+}
+
+function validatePreLaunch {
+
+    ! validateUserIdAsStorageOwner "${ownerId}" \
+        && echo "ERROR:${0}:${LINENO}: Not exist account Id '${ownerId}'." >&2 \
+        && stateOfProcess=${errorMisc}
+
+    # XXX - routine name is processed too far from others...
+    [ ! -f "${fileStorageContainer}" ] \
+        && [ "${routineName}" != "create" ] \
+        && echo "ERROR:${0}:${LINENO}: Not found '${fileStorageContainer}'." >&2 \
+        && stateOfProcess=${errorMisc}
+
+    [ -n "${fileStorageContainer}" ] \
+        && validateContainerFileName "${fileStorageContainer}"
+
+    # Size of a storage to be created for DMCrypt & LUKS must not be
+    # less than (0.5,1,2Mib?) some value. Or
+    # 'cryptsetup --verbose luksFormat' will return error:
+    #       Cannot read device /dev/loop0.
+    #       Command failed with code 15: Block device required
+    declare -r minContainerSize="2"
+    [ -z "${sizeStorageInMb}" ] \
+        || [ ${sizeStorageInMb} -lt 2 ] \
+        && [ "${routineName}" == "create" ] \
+        && echo "ERROR:${0}:${LINENO}: Storage size must be greater than '${minContainerSize}'." >&2 \
+        && stateOfProcess=${errorMisc}
+
+    [ ${stateOfProcess} != ${noError} ] \
+        && echo "ERROR:${0}:${LINENO}: Failed with CLI arguments parsing." >&2 \
+        && exit ${stateOfProcess}
+
+}
+
+function validateUserIdAsStorageOwner {
+    local -r accountId="${1}"
+
+    local searchResult=""
+
+    searchResult="$( grep "^${accountId}:" "/etc/passwd" )"
+    [ -z "${searchResult}" ] \
+        && return ${codeFailure}
+    return ${codeSuccess}
+}
+
+function getThisScriptFileName {
+    # This function may be more elegant way to heal a path.
+
+    local dName="$( dirname "${0}" )"
+    local fName="$( basename "${0}" )"
+
+    [ "${dName}" == "." ] && dName="$( pwd )"
+    echo "${dName}/${fName}"
+}
+
+function healPath {
+    local name="${1}"
+
+    [ "${name:0:1}" == "\"" ] \
+        || [ "${name:${#name}-1:1}" == "\"" ] \
+        && echo "ERROR:${0}:${LINENO}: Bad name format, double quotes are not allowed. Error token: ${name}" >&2
+
+    case "${name}" in
+    '.')
+        name="./"
+    ;;
+    '~')
+        name="~/"
+    ;;
+    esac
+    case "${name:0:2}" in
+    './')
+        name="$( pwd )/${name:2}"
+    ;;
+    '~/')
+        name="${HOME}/${name:2}"
+    ;;
+    esac
+
+    name="${name%/}" # Cut off trailing '/', if any.
+    echo "${name}"
+}
+
+function readFeedbackOn {
+    local -r question="${1}"
+    local -r returnCodeYes="0"
+    local -r returnCodeNo="1"
+
+    while : ; do
+        read -p "${question} [y/n]" feedback
+        shopt -s nocasematch
+        case "${feedback}" in
+        y|yes)
+            return "${returnCodeYes}"
+        ;;
+        n|no)
+            return "${returnCodeNo}"
+        ;;
+        *)
+            echo "Enter yes or no."
+        ;;
+        esac
+        shopt -u nocasematch
+    done
+}
+
+function showDoc {
+echo "
+Script is for management of encrypted file storages.
+
+USAGE
+
+    sudo $( basename "${0}" ) action options
+
+ACTIONS
+
+    --create|c \\
+        --mnt=\"/mount/point/directory\"
+        --storage-file=\"fileName\"
+        --size=2
+        --fs=ext3
+        --owner=\"userName\"
+
+    --mount|m \\
+        --mnt=\"/mount/point/directory\"
+        --storage-file=\"fileName\"
+
+    --umount|u \\
+        --mnt=\"/mount/point/directory\"
+        --storage-file=\"fileName\"
+
+    --is-mounted|i \\
+        --mnt=\"/mount/point/directory\"
+
+    --eject|e
+
+        Not implemented. May be: export as 'tar.bz2' or similar.
+
+    --backup-header|b \\
+        --backup-file=\"/file/name\"
+
+        Backup the cryptheader of a storage.
+
+    --restore-header|r \\
+        --backup-file=\"/file/name\"
+
+        Restore from backup cryptheader of a storage. Be aware.
+
+    --output-example-config
+
+        Will print on screen an example of configuration file content.
+
+    --ui
+
+        Not implemented. May be: based on Dialog.
+
+    --help
+
+OPTIONS
+
+    --storage-file=\"fileName\"
+    --if=\"fileName\"
+
+        Storage container file name.
+
+    --size
+
+        Storage container size in Mb.
+
+    (--filesystem=fsId | --fs=fsId)
+
+        Hardcoded to be 'ext3'.
+
+    --owner=\"ownerName\"
+
+        Existent user name. Will be set as owner of storage container.
+
+    --mnt=\"/mount/point\"
+
+        Directory to be mount point.
+
+    --luks-options=\"options to be passed to storage creation utility\"
+
+        Used while a storage creation only. As single string all additional options for 'cryptsetup luksFormat ...', except device name.
+
+    --backup-file=\"/file/name\"
+
+        File with backup of cryptheader for a storage.
+
+    --config=\"/file/with/configuration\"
+
+        It is possible not specify full set of options in command line interface. Instead may be used configuration file. If no file specified, it will try to pick up default configuration file. It is '~/.config/dmlencr/dmlencr.conf'. '~' is evaluated on the fly, for this instance the file name is '${fileConfigurationDefault}'.
+
+        Access rights to configuration file are reset at storage creation - as 'rw' for owner only.
+
+Options are picked up in order:
+     1) command line interface (CLI),
+     2) configuration file
+            a) configuration file from CLI, if exist,
+            b) or configuration file located in default directory.
+
+If some options were specified earlier, they'll take precedence over the others.
+
+One may set up sudoers policy:
+    ${USER} ALL = NOPASSWD: /usr/bin/$( basename "${0}" ) m
+    ${USER} ALL = NOPASSWD: /usr/bin/$( basename "${0}" ) u
+
+One may create a handy file-wrapper with short name and place it anywhere in a directory specified in 'PATH' system wide variable. You may have several storages with their own wrappers, in order to use short commands for mount/unmount/etc. At the moment:
+    PATH=\"${PATH}\"
+
+Let wrapper's file name be say '/usr/bin/dle' (you may choose your own directory and file name). The file content is:
+
+    #!/bin/bash
+    sudo dmlencr \"\${@}\"
+
+Remember to make wrapper's file executable, just do:
+    chmod 755 \"/usr/bin/dle\"
+
+If the wrapper is used, and it's file have name say 'dle', storage can be mounted/unmounted etc. via commands like:
+    dle m
+    dle u
+
+It is a good idea to do:
+    chown yourUserName:yourUserName \"/usr/bin/dle\"
+    chmod 700 \"/usr/bin/dle\"
+
+COPYRIGHT AND LICENCE
+
+Copyright © 2008-2012 Alex Vesev. License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>.
+
+This is free software: you are free to change and redistribute it. There is NO WARRANTY, to the extent permitted by law.
+"
+}
+
+# # #
+ # #
+# #
+ #
+#
+
+[ ${UID} != 0 ] \
+    && echo "ERROR:${0}:${LINENO}: This script is run NOT as root." >&2 \
+    && stateOfProcess=${errorMisc} \
+    && exit ${stateOfProcess}
+
+[ ${#} == 0 ] && showDoc && exit ${errorMisc}
+fileWithThisScript="$( getThisScriptFileName )"
+dirWirhThisScript="$( dirname "${fileWithThisScript}" )"
+
+fileConfiguration="$( tryEvaluateConfigNameAmongArguments "${@}" )" \
+    ; [ ${?} != ${codeSuccess} ] \
+            && exit ${errorMisc}
+
+declare -a optionsListFromConfigFile
+unset optionsListFromConfigFile \
+    && [ -n "${fileConfiguration}" ] \
+    && setArgumentsFromConfig "${fileConfiguration}"
+
+# Order of "${@}" and "options-From-Config" affects arguments source priority.
+argumentsListAssembledFromFileAndCLI=("${@}" "${optionsListFromConfigFile[@]}")
+
+for optionPairKeyValue in "${argumentsListAssembledFromFileAndCLI[@]}" ; do
+    argument="${optionPairKeyValue#--}" # Strip leading '--'.
+    argument="${argument%%=*}" # Strip trailing '=*'
+    valueForArgument="${optionPairKeyValue#*=}"
+
+    case "${argument}" in
+    help)
+        showDoc
+        exit ${stateOfProcess}
+    ;;
+    ui)
+        [ -z "${routineName}" ] \
+            && routineName="${argument}"
+        break
+    ;;
+
+# Actions are below:
+    output-example-config)
+        [ -z "${routineName}" ] \
+            && declare -r routineName="output-example-config"
+    ;;
+    create|c)
+        [ -z "${routineName}" ] \
+            && declare -r routineName="create"
+    ;;
+    mount|m)
+        [ -z "${routineName}" ] \
+            && declare -r routineName="mount"
+    ;;
+    umount|u)
+        [ -z "${routineName}" ] \
+            && declare -r routineName="umount"
+    ;;
+    is-mounted|i)
+        [ -z "${routineName}" ] \
+            && declare -r routineName="is-mounted"
+    ;;
+    eject|e)
+        [ -z "${routineName}" ] \
+            && declare -r routineName="eject"
+    ;;
+    backup-header|b)
+        [ -z "${routineName}" ] \
+            && declare -r routineName="backup-header"
+    ;;
+    restore-header|r)
+        [ -z "${routineName}" ] \
+            && declare -r routineName="restore-header"
+    ;;
+
+# Options are below.
+    storage-file)
+        if [ -z "${fileStorageContainer}" ] ; then
+            fileStorageContainer="$( healPath "${valueForArgument}" )"
+            dirWithFileStorageContainer="$( dirname "${fileStorageContainer}" )"
+
+            mappingName="$( generateMappingNameFromFileName "${fileStorageContainer}" )"
+        fi
+    ;;
+    size)
+        [ -z "${sizeStorageInMb}" ] \
+            && sizeStorageInMb="${valueForArgument}"
+    ;;
+    filesystem|fs)
+        fSystemId="ext3"
+        [ -z "${fSystemId}" ] \
+            && fSystemId="${valueForArgument}"
+    ;;
+    owner)
+        [ -z "${ownerId}" ] \
+            && ownerId="${valueForArgument}"
+    ;;
+    mnt)
+        [ -z "${dirMountPoint}" ] \
+            && dirMountPoint="${valueForArgument}"
+    ;;
+    luks-options)
+        [ -z "${optionsLuks}" ] \
+            && optionsLuks="${valueForArgument}"
+    ;;
+    backup-file)
+        [ -z "${fileHeaderBackup}" ] \
+            && fileHeaderBackup="$( healPath "${valueForArgument}" )"
+    ;;
+    config)
+        #echo "INFORMATION:${0}:${LINENO}: Picked up configuration file '${fileConfiguration}'." >&2
+        true
+    ;;
+    *)
+        echo "ERROR:${0}:${LINENO}: Unknown option '${argument}'." >&2
+        stateOfProcess=${errorMisc}
+    ;;
+    esac
+done
+[ "${stateOfProcess}" != "${noError}" ] \
+    && echo "ERROR:${0}:${LINENO}: Failed with arguments parsing." >&2 \
+    && exit ${stateOfProcess}
+validatePreLaunch
+
+case "${routineName}" in
+    ui)
+        echo "ERROR:${0}:${LINENO}: Unimplemented action '${routineName}'." >&2
+        stateOfProcess=${errorMisc}
+    ;;
+    output-example-config)
+        printConfigurationFileExample
+    ;;
+    create)
+        # Keep this section "monolith" as a list of commands for HowTo?
+        # Do not split, using functions, or do not do any other refactoring?
+
+        # XXX - Already declared...
+        declare -r mappingName="$( generateMappingNameFromFileName "${fileStorageContainer}" )"
+
+        setRestrictedAccessForFile "${ownerId}" "${ownerId}" "${fileConfiguration}"
+
+        createEmptyStorageContainer "${fileStorageContainer}" "${sizeStorageInMb}"
+        createMntPoint "${dirMountPoint}"
+
+        modprobe loop
+
+        declare -r fileLoopDev="$( associateFileWithLoopDevice "${fileStorageContainer}" )"
+
+        echo "INFORMATION:${0}:${LINENO}: Below will be requested key-phrase for this storage." >&2
+        cryptsetup ${optionsLuks} --verbose luksFormat ${fileLoopDev}
+
+        echo "INFORMATION:${0}:${LINENO}: Created storage container is going to be opened. Will need previous key-phrase again." >&2
+        cryptsetup --verbose luksOpen "${fileLoopDev}" "${mappingName}"
+
+        echo "INFORMATION:${0}:${LINENO}: Creating filesystem." >&2
+        mkfs.ext3 /dev/mapper/${mappingName}
+
+        echo -n "" > "${dirMountPoint}/not_mounted"
+        setRestrictedAccessForFile "${ownerId}" "${ownerId}" "${dirMountPoint}/not_mounted"
+        chmod 400 "${dirMountPoint}/not_mounted"
+        mount -t ext3 /dev/mapper/${mappingName} "${dirMountPoint}" \
+            && setRestrictedAccessForDirectory "${ownerId}" "${ownerId}" "${dirMountPoint}"
+
+        echo "INFORMATION:${0}:${LINENO}: Closing storage." >&2
+        #unmountEncryptedStorage "${mappingName}"
+        unmountEncryptedStorage "${fileStorageContainer}"
+        echo "INFORMATION:${0}:${LINENO}: Storage '$( basename "${fileStorageContainer}" )' created." >&2
+
+    ;;
+    mount)
+        if isUnbuttoned "${fileStorageContainer}" "${dirMountPoint}" "${mappingName}" \
+                                1>/dev/null 2>/dev/null
+        then
+            printMessageIsAlreadyMounted
+        else
+            mountEncryptedStorage "${fileStorageContainer}" "${dirMountPoint}"
+        fi
+    ;;
+    umount)
+        unmountEncryptedStorage "${fileStorageContainer}"
+        if isUnbuttoned "${fileStorageContainer}" "${dirMountPoint}" "${mappingName}" \
+                1>/dev/null 2>/dev/null
+        then
+            printPlaceHoldersForMountPoint "${dirMountPoint}"
+            printMessageIsInUse
+        else
+            printMessageIsClosed
+        fi
+    ;;
+    is-mounted)
+        isUnbuttoned "${fileStorageContainer}" "${dirMountPoint}" "${mappingName}" 1>/dev/null 2>/dev/null \
+            && printMessageIsInUse \
+            && exit ${noError}
+        printMessageIsClosed
+        exit ${noError}
+    ;;
+    eject)
+        echo "ERROR:${0}:${LINENO}: Unimplemented action '${routineName}'." >&2
+        stateOfProcess=${errorMisc}
+    ;;
+    backup-header)
+        # Donor -> Acceptor
+        backupHeader "${fileStorageContainer}" "${fileHeaderBackup}"
+    ;;
+    restore-header)
+        # From -> To
+        restoreHeader "${fileHeaderBackup}" "${fileStorageContainer}"
+    ;;
+    *)
+        echo "ERROR:${0}:${LINENO}: Unknown action name '${routineName}'. Was it specified?" >&2
+        stateOfProcess=${errorMisc}
+    ;;
+esac
+
+[ ${stateOfProcess} != ${noError} ] \
+    && echo "ERROR:${0}:${LINENO}: Finished with errors." >&2
+exit ${stateOfProcess}
